@@ -1,13 +1,18 @@
+import 'dart:async';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
-import 'package:tflite/tflite.dart';
+import 'package:image/image.dart' as img;
+// import 'package:tflite/tflite.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final cameras = await availableCameras();
-  final firstCamera = cameras.first;
+  final firstCamera = cameras[1];
 
   runApp(MyApp(camera: firstCamera));
 }
@@ -43,7 +48,7 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
   bool isDetecting = false;
   List<Rect> rects = [];
   List<Color> colors = [];
-
+  Interpreter? model;
   CameraImage? get cameraImage => null;
 
   @override
@@ -58,57 +63,18 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
   }
 
   Future<void> loadModel() async {
-    await Tflite.loadModel(
-      model: "assets/antispoofing_model.tflite",
+    model = await Interpreter.fromAsset(
+      "assets/antispoofing_model.tflite",
     );
+    model?.allocateTensors();
   }
 
   @override
   void dispose() {
     _controller.dispose();
     faceDetector.close();
-    Tflite.close();
+    model?.close();
     super.dispose();
-  }
-
-  Future<void> runModelOnFrame(CameraImage img, List<Face> faces) async {
-    for (Face face in faces) {
-      final left = face.boundingBox.left.toInt();
-      final top = face.boundingBox.top.toInt();
-      final width = face.boundingBox.width.toInt();
-      final height = face.boundingBox.height.toInt();
-
-      var imgBytes = concatenatePlanes(img.planes);
-
-      var result = await Tflite.runModelOnBinary(
-        binary: imgBytes.buffer.asUint8List(),
-        numResults: 1,
-      );
-
-      setState(() {
-        if (result![0]["label"] == "spoof") {
-          drawBoundingBox(left, top, width, height, Colors.red);
-        } else {
-          drawBoundingBox(left, top, width, height, Colors.green);
-        }
-      });
-    }
-  }
-
-  Uint8List concatenatePlanes(List<Plane> planes) {
-    WriteBuffer allBytes = WriteBuffer();
-    for (Plane plane in planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-    return allBytes.done().buffer.asUint8List();
-  }
-
-  void drawBoundingBox(int left, int top, int width, int height, Color color) {
-    setState(() {
-      rects.add(Rect.fromLTWH(left.toDouble(), top.toDouble(), width.toDouble(),
-          height.toDouble()));
-      colors.add(color);
-    });
   }
 
   @override
@@ -136,24 +102,109 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
         onPressed: () async {
           try {
             await _initializeControllerFuture;
-            final image = await _controller.takePicture();
-            final faces = await detectFaces(image);
-            // Convert the image to CameraImage format before passing to runModelOnFrame
-            // Note: You may need to implement a method to convert XFile to CameraImage
-            await runModelOnFrame(cameraImage!, faces);
+            _controller.startImageStream((CameraImage image) async {
+              if (!canCapture) return;
+              canCapture = false;
+              final XFile imageXFile = await _controller.takePicture();
+              final faces = await detectFaces(imageXFile);
+              await runModelOnFrame(image, faces);
+              canCapture = true;
+            });
           } catch (e) {
             print(e);
           }
         },
-        child: Icon(Icons.camera),
+        child: const Icon(Icons.camera),
       ),
     );
+  }
+
+  bool canCapture = true;
+
+  void drawBoundingBox(int left, int top, int width, int height, Color color) {
+    setState(() {
+      rects.add(Rect.fromLTWH(left.toDouble(), top.toDouble(), width.toDouble(),
+          height.toDouble()));
+      colors.add(color);
+    });
+  }
+
+  Future<void> runModelOnFrame(CameraImage image, List<Face> faces) async {
+    for (Face face in faces) {
+      final left = face.boundingBox.left.toInt();
+      final top = face.boundingBox.top.toInt();
+      final width = face.boundingBox.width.toInt();
+      final height = face.boundingBox.height.toInt();
+      List<double> result = [];
+      try {
+        // var imgBytes = concatenatePlanes(img.planes).buffer.asUint8List();
+
+        var imgBytes = convertCameraImageToUint8List(image);
+        model?.run(
+          imgBytes,
+          result,
+        );
+      } catch (e) {
+        canCapture = true;
+        print("Mohamed: ${e.toString()}");
+      }
+      print("Mohamed: ${result.first}");
+      if (result.isNotEmpty) {
+        setState(() {
+          if (result[0] > 0.5) {
+            drawBoundingBox(left, top, width, height, Colors.red);
+          } else {
+            drawBoundingBox(left, top, width, height, Colors.green);
+          }
+        });
+      }
+    }
+  }
+
+  Uint8List concatenatePlanes(List<Plane> planes) {
+    WriteBuffer allBytes = WriteBuffer();
+    for (Plane plane in planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    return allBytes.done().buffer.asUint8List();
   }
 
   Future<List<Face>> detectFaces(XFile imageFile) async {
     final InputImage inputImage = InputImage.fromFilePath(imageFile.path);
     final faces = await faceDetector.processImage(inputImage);
     return faces;
+  }
+
+  Uint8List convertCameraImageToUint8List(CameraImage image) {
+    final int width = image.width;
+    final int height = image.height;
+
+    final img.Image rgbImage = img.Image(width: width, height: height);
+
+    final int uvRowStride = image.planes[1].bytesPerRow;
+    final int uvPixelStride = image.planes[1].bytesPerPixel!;
+
+    for (int y = 0; y < height; y++) {
+      for (int x = 0; x < width; x++) {
+        final int uvIndex =
+            uvPixelStride * (x / 2).floor() + uvRowStride * (y / 2).floor();
+        final int index = y * width + x;
+
+        final int yValue = image.planes[0].bytes[index];
+        final int uValue = image.planes[1].bytes[uvIndex];
+        final int vValue = image.planes[2].bytes[uvIndex];
+
+        int r = (yValue + (1.370705 * (vValue - 128))).round();
+        int g =
+            (yValue - (0.337633 * (uValue - 128)) - (0.698001 * (vValue - 128)))
+                .round();
+        int b = (yValue + (1.732446 * (uValue - 128))).round();
+
+        rgbImage.setPixel(x, y, img.ColorFloat16.rgb(r, g, b));
+      }
+    }
+
+    return Uint8List.fromList(img.encodeJpg(rgbImage));
   }
 }
 
