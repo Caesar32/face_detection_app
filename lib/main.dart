@@ -1,19 +1,16 @@
 import 'dart:async';
-
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
 import 'package:image/image.dart' as img;
-// import 'package:tflite/tflite.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final cameras = await availableCameras();
   final firstCamera = cameras[1];
-
   runApp(MyApp(camera: firstCamera));
 }
 
@@ -43,7 +40,6 @@ class FaceDetectionScreen extends StatefulWidget {
 class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
   late CameraController _controller;
   late Future<void> _initializeControllerFuture;
-  // ignore: deprecated_member_use
   final FaceDetector faceDetector = GoogleMlKit.vision.faceDetector();
   bool isDetecting = false;
   List<Rect> rects = [];
@@ -121,12 +117,46 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
 
   bool canCapture = true;
 
-  void drawBoundingBox(int left, int top, int width, int height, Color color) {
-    setState(() {
-      rects.add(Rect.fromLTWH(left.toDouble(), top.toDouble(), width.toDouble(),
-          height.toDouble()));
-      colors.add(color);
-    });
+  void drawFocusCorners(Canvas canvas, Rect rect, Color color) {
+    final double cornerLength = 20.0;
+    final double thickness = 3.0;
+
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = thickness;
+
+    final corners = [
+      // Top-left corner
+      [
+        Offset(rect.left, rect.top),
+        Offset(rect.left + cornerLength, rect.top),
+        Offset(rect.left, rect.top + cornerLength),
+      ],
+      // Top-right corner
+      [
+        Offset(rect.right, rect.top),
+        Offset(rect.right - cornerLength, rect.top),
+        Offset(rect.right, rect.top + cornerLength),
+      ],
+      // Bottom-left corner
+      [
+        Offset(rect.left, rect.bottom),
+        Offset(rect.left + cornerLength, rect.bottom),
+        Offset(rect.left, rect.bottom - cornerLength),
+      ],
+      // Bottom-right corner
+      [
+        Offset(rect.right, rect.bottom),
+        Offset(rect.right - cornerLength, rect.bottom),
+        Offset(rect.right, rect.bottom - cornerLength),
+      ],
+    ];
+
+    for (var corner in corners) {
+      canvas.drawLine(corner[0], corner[1], paint);
+      canvas.drawLine(corner[0], corner[2], paint);
+    }
   }
 
   Future<void> runModelOnFrame(CameraImage image, List<Face> faces) async {
@@ -135,20 +165,17 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
       final top = face.boundingBox.top.toInt();
       final width = face.boundingBox.width.toInt();
       final height = face.boundingBox.height.toInt();
-      List<double> result = [];
+      List<double> result = List.filled(1, 0.0);
       try {
-        // var imgBytes = concatenatePlanes(img.planes).buffer.asUint8List();
-
-        var imgBytes = convertCameraImageToUint8List(image);
+        var imgBytes = preprocessFace(image, left, top, width, height);
         model?.run(
           imgBytes,
           result,
         );
       } catch (e) {
         canCapture = true;
-        print("Mohamed: ${e.toString()}");
+        print("Error: ${e.toString()}");
       }
-      print("Mohamed: ${result.first}");
       if (result.isNotEmpty) {
         setState(() {
           if (result[0] > 0.5) {
@@ -161,21 +188,41 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
     }
   }
 
-  Uint8List concatenatePlanes(List<Plane> planes) {
-    WriteBuffer allBytes = WriteBuffer();
-    for (Plane plane in planes) {
-      allBytes.putUint8List(plane.bytes);
+  void drawBoundingBox(int left, int top, int width, int height, Color color) {
+    setState(() {
+      rects.add(Rect.fromLTWH(left.toDouble(), top.toDouble(), width.toDouble(),
+          height.toDouble()));
+      colors.add(color);
+    });
+  }
+
+  img.Image copyCrop(img.Image src, int x, int y, int w, int h) {
+    // Ensure cropping dimensions are within image bounds
+    int startX = x < 0 ? 0 : x;
+    int startY = y < 0 ? 0 : y;
+    int endX = (x + w) > src.width ? src.width : (x + w);
+    int endY = (y + h) > src.height ? src.height : (y + h);
+
+    img.Image cropped = img.Image(width: endX - startX, height: endY - startY);
+    for (int i = 0; i < cropped.height; i++) {
+      for (int j = 0; j < cropped.width; j++) {
+        cropped.setPixel(j, i, src.getPixel(startX + j, startY + i));
+      }
     }
-    return allBytes.done().buffer.asUint8List();
+
+    return cropped;
   }
 
-  Future<List<Face>> detectFaces(XFile imageFile) async {
-    final InputImage inputImage = InputImage.fromFilePath(imageFile.path);
-    final faces = await faceDetector.processImage(inputImage);
-    return faces;
+  Uint8List preprocessFace(CameraImage image, int x, int y, int w, int h) {
+    final img.Image originalImage = convertCameraImageToImage(image);
+    final img.Image face =
+        copyCrop(originalImage, x - 5, y - 5, w + 10, h + 10);
+    final img.Image resizedFace = img.copyResize(face, width: 160, height: 160);
+    final Float32List input = imageToByteList(resizedFace, 160);
+    return input.buffer.asUint8List();
   }
 
-  Uint8List convertCameraImageToUint8List(CameraImage image) {
+  img.Image convertCameraImageToImage(CameraImage image) {
     final int width = image.width;
     final int height = image.height;
 
@@ -200,11 +247,36 @@ class _FaceDetectionScreenState extends State<FaceDetectionScreen> {
                 .round();
         int b = (yValue + (1.732446 * (uValue - 128))).round();
 
-        rgbImage.setPixel(x, y, img.ColorFloat16.rgb(r, g, b));
+        rgbImage.setPixel(x, y, getColor(r, g, b) as img.Color);
       }
     }
 
-    return Uint8List.fromList(img.encodeJpg(rgbImage));
+    return rgbImage;
+  }
+
+  int getColor(int r, int g, int b) {
+    return (0xFF << 24) | (r << 16) | (g << 8) | b;
+  }
+
+  Float32List imageToByteList(img.Image image, int inputSize) {
+    var convertedBytes = Float32List(1 * inputSize * inputSize * 3);
+    var buffer = Float32List.view(convertedBytes.buffer);
+    int pixelIndex = 0;
+    for (int i = 0; i < inputSize; i++) {
+      for (int j = 0; j < inputSize; j++) {
+        int pixel = image.getPixel(j, i) as int;
+        buffer[pixelIndex++] = ((pixel >> 16) & 0xFF) / 255.0; // Red
+        buffer[pixelIndex++] = ((pixel >> 8) & 0xFF) / 255.0; // Green
+        buffer[pixelIndex++] = (pixel & 0xFF) / 255.0; // Blue
+      }
+    }
+    return buffer;
+  }
+
+  Future<List<Face>> detectFaces(XFile imageFile) async {
+    final InputImage inputImage = InputImage.fromFilePath(imageFile.path);
+    final faces = await faceDetector.processImage(inputImage);
+    return faces;
   }
 }
 
@@ -219,11 +291,49 @@ class BoundingBoxPainter extends CustomPainter {
     for (int i = 0; i < rects.length; i++) {
       final rect = rects[i];
       final color = colors[i];
-      final paint = Paint()
-        ..color = color
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 3.0;
-      canvas.drawRect(rect, paint);
+      drawFocusCorners(canvas, rect, color);
+    }
+  }
+
+  void drawFocusCorners(Canvas canvas, Rect rect, Color color) {
+    final double cornerLength = 20.0;
+    final double thickness = 3.0;
+
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = thickness;
+
+    final corners = [
+      // Top-left corner
+      [
+        Offset(rect.left, rect.top),
+        Offset(rect.left + cornerLength, rect.top),
+        Offset(rect.left, rect.top + cornerLength),
+      ],
+      // Top-right corner
+      [
+        Offset(rect.right, rect.top),
+        Offset(rect.right - cornerLength, rect.top),
+        Offset(rect.right, rect.top + cornerLength),
+      ],
+      // Bottom-left corner
+      [
+        Offset(rect.left, rect.bottom),
+        Offset(rect.left + cornerLength, rect.bottom),
+        Offset(rect.left, rect.bottom - cornerLength),
+      ],
+      // Bottom-right corner
+      [
+        Offset(rect.right, rect.bottom),
+        Offset(rect.right - cornerLength, rect.bottom),
+        Offset(rect.right, rect.bottom - cornerLength),
+      ],
+    ];
+
+    for (var corner in corners) {
+      canvas.drawLine(corner[0], corner[1], paint);
+      canvas.drawLine(corner[0], corner[2], paint);
     }
   }
 
